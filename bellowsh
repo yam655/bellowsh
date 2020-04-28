@@ -1,0 +1,1291 @@
+#!/usr/bin/env python3
+
+import os
+from pathlib import Path
+from subprocess import run
+import shutil
+from cmd import Cmd
+from collections import OrderedDict
+import re
+import pwd
+import grp
+import argparse
+import sys
+import shlex
+
+# Standard Python handles timezones poorly
+import arrow
+
+users = {}
+online_only = False
+colours = sys.stdout.isatty()
+args = None
+
+BSD_PS = True
+BSD_LAST = True
+
+_COLOURS = {
+    'red':31,
+    'green':32,
+    'yellow':33,
+    'blue':34,
+    'magenta':35,
+    'cyan':36,
+}
+
+NEVER_VALID_SHELLS = {'false', 'nologin'}
+STILL_LOGGED_IN = r'still logged in'
+SHUTDOWN = r'shutdown'
+LAST_RE = re.compile(r'^(?P<user>\S+)'
+                     r'\s+(?P<port>\S+)'
+                     r'\s+(?P<starttime>[-:0-9T.+Z]+)'
+                     r'\s*(?: - |   )\s*'
+                     r'\s*(?P<endtime>\S+|' + SHUTDOWN + '|' + STILL_LOGGED_IN + r')'
+                     r'(?:\s*\((?P<duration>[^\)]+)\))?'
+                     r'\s*$')
+LAST_RE_BSD = re.compile(r'^(?P<user>\S+)'
+                     r'\s+(?P<port>\S+)'
+                     r'\s+(?P<host>\S+)?'
+                     r'\s+(?P<starttime>(?:[A-Z][a-z][a-z] ){2}[ 0-9]{2} [0-9]{2}:[0-9]{2})'
+                     r'\s*(?: - |   )\s*'
+                     r'\s*(?P<endtime>\S+|' + SHUTDOWN + '|' + STILL_LOGGED_IN + r')'
+                     r'(?:\s*\((?P<duration>[^\)]+)\))?'
+                     r'\s*$'
+                    )
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-l", "--local", action="store_true",
+                    help="""
+                        Local users only.
+                        Do not read remote users from ~/.bellowsh/remote, which makes bellowsh
+                        very fast as no remote servers have to be polled.""")
+parser.add_argument("-n", "--no-loop", action="store_true",
+                    help="""
+                        Non-interactive mode.
+                        Print a user listing and then immediately quit without reading
+                        any input from the user.""")
+parser.add_argument("-o", "--online-only", action="store_true",
+                    help="""
+                        Online users only.
+                        Show only users who are logged in right now.  In combination
+                        with non-interactive mode, this turns bellowsh into a possible
+                        replacement for the traditional `who` command.""")
+parser.add_argument("-r", "--remote", action="store_true",
+                    help="""
+                        Remote users only.
+                        Do not display local users, only remote users listed in
+                        ~/.bellowsh/remote.""")
+
+class User:
+    username = None
+    home = None
+    mesg_ok = False
+    is_remote = False
+    logged_in = False
+    last_login = arrow.get(0)
+    remote_plan = None
+    highlight = False
+    tz = None
+
+    @classmethod
+    def make(cls, username, *, highlight=False):
+        self = User()
+        self.username = username
+        if '@' in username:
+            self.is_remote = True
+            self.remote_plan = "No remote plan."
+            if username.endswith("@localhost") or username.endswith("@"):
+                self.is_remote = False
+                self.remote_plan = "No plan."
+                self.highlight = True
+                self.username = username.split('@')[0]
+        elif highlight:
+            self.highlight = True
+        return self
+
+
+def shlex_join(thing):
+    ''' Join a shlex string. In Python 3.8, we can use shlex.join '''
+    return ' '.join(shlex.quote(arg) for arg in thing)
+
+class ConfigError(RuntimeError):
+    def __init__(self, msg):
+        super().__init__(msg)
+
+def on_path(prog):
+    for dname in os.environ.get("PATH").split(':'):
+        if not dname:
+            continue
+        path = Path(dname) / prog
+        try:
+            if (path.exists() and path.is_file() and 
+                        path.stat().st_mode & 0b111 != 0):
+                return True
+        except:
+            return False
+    return False
+
+def get_editor():
+    env_editor = os.environ.get('VISUAL', os.environ.get('EDITOR'))
+    if env_editor:
+        return env_editor
+    # sensible-editor is Debian-specific, but the best default
+    for prog in ('sensible-editor', 'nano', 'vi'):
+        if on_path(prog):
+            return prog
+    raise ConfigError('Please set VISUAL or EDITOR to an installed editor.')
+
+def run_if_installed(whats, *args, remote_failure=False, user=None, input_prompt=None, input_msg=None):
+    if user is not None:
+        if remote_failure and user.is_remote:
+            print(f"{whats[0].title()} is not available for remote users.")
+            return
+    if isinstance(whats, str):
+        whats = [whats,]
+    if user is not None and not args:
+        args = [user.username]
+    app = None
+    for what in whats:
+        if on_path(what):
+            app = what
+    if not app:
+        print(f"{whats[0].title()} is not installed.")
+        return
+    run_args=[app]
+    run_args.extend(args)
+    if input_prompt:
+        if '\n' in input_prompt:
+            input_prompt_txt = input_prompt.split('\n')
+        input_ = input(input_prompt).strip()
+        if input_:
+            input_msg = input_
+    run(run_args, input=input_msg, text=True)
+
+def colourise(colour, string):
+    global _COLOURS
+    if not colours or colour not in _COLOURS:
+        return string
+    return f"\N{ESCAPE}[{_COLOURS[colour]}m{string}\N{ESCAPE}[0m"
+
+def yes_no_abort(prompt):
+    accepted = None
+    while accepted is None:
+        choice = input(f'{prompt} [Yes/No/Abort]? ').strip().lower()
+        if not choice:
+            continue
+        if len(choice) > 1:
+            choice = choice[0]
+        if choice in 'yna':
+            accepted = choice
+    return accepted
+
+def select(prompt, options, *, deflt=None, user_defined=False):
+    accepted = None
+    while accepted is None:
+        for num, opt in enumerate(options):
+            dfl=""
+            num_str = f'[{num+1}]'
+            if deflt == opt:
+                dfl="(*)"
+                print(f'{num_str:5}(*){opt:15}',end='')
+            else:
+                print(f'{num_str:5}{opt:18}',end='')
+            if (num+1) % 4 == 0:
+                print('')
+        else:
+            if (num+1) % 4 != 0:
+                print('')
+        if deflt:
+            print(f"   (*) Default is {deflt}")
+        answer = input(prompt).strip()
+        if not answer:
+            if deflt:
+                accepted = deflt
+                continue
+            else:
+                print("Let's try that again...")
+                continue
+        if answer in options:
+            accepted = answer
+        elif answer.isdigit():
+            a = int(answer)-1
+            if a < 0 or a >= len(options):
+                print("What was that?")
+                continue
+            accepted = options[a]
+        elif user_defined != False and user_defined is not None:
+            accepted = answer
+        else:
+            print("What was that?")
+    return accepted
+
+filters = [
+    # cowsay
+    'cowsay', 'cowthink',
+    # figlet
+    'figlet', 'toilet',
+    # BSD filters `apt get filters`
+    'LOLCAT', 'b1ff', 'censor', 'chef', 'cockney', 'eleet', 'fanboy',
+    'fudd', 'jethro', 'jibberish', 'jive', 'ken', 'kenny', 'kraut',
+    'ky00te', 'nethackify', 'newspeak', 'nyc', 'pirate', 'rasterman',
+    'scottish', 'scramble', 'spammer', 'studly', 'uniencode',
+    'upside-down'
+]
+
+def select_filter(msg, how=None, detail=None):
+    filter_prgs = ["normal"]
+    enhanced = {'cowsay', 'cowthink', 'figlet', 'toilet'}
+
+    for prg in filters:
+        if on_path(prg):
+            filter_prgs.append(prg)
+    filtr_prg = None
+    confirmed = False
+    ok_msg = msg
+    if len(filter_prgs) < 2:
+        return ok_msg
+    if how and how not in filter_prgs:
+        if how.isdigit():
+            choice = int(how)
+            if choice >= 0 and choice < len(filter_prgs):
+                how = filter_prgs[choice]
+            else:
+                how = None
+                detail = None
+        else:
+            how = None
+            detail = None
+
+    while not confirmed:
+        if how:
+            filtr = how
+            how = None
+        else:
+            filtr = select("How would you like to say it? ", filter_prgs, deflt="normal",
+                        user_defined=True)
+        if filtr in enhanced:
+            if filtr in ('cowsay', 'cowthink'):
+                options = run(['cowsay', '-l'], capture_output=True,
+                                         text=True).stdout.split('\n',1)[-1].split()
+                if not options:
+                    detail = None
+                    continue
+                if detail:
+                    if detail in options:
+                        filtr = [filtr, '-f', detail]
+                    elif detail.isdigit():
+                        choice = int(detail)
+                        if choice >= 0 and choice < len(options):
+                            filtr = [filtr, '-f', options[choice]]
+
+                if isinstance(filtr, str):
+                    detail = select("Which cow file to use?", options)
+                    filtr = [filtr, '-f', detail]
+            elif filtr in ('figlet','toilet'):
+                option_dir = Path(run([filtr, '-I', '2'], capture_output=True,
+                                         text=True).stdout.strip())
+                # `-I 5` is supposed to return this, but
+                #   `figlet` returns `flf2` -- which it doesn't ship with
+                #   `toilet` doesn't return anything
+                if filtr == 'toilet':
+                    option_suffixes = ('tlf', 'tlf2')
+                elif filtr == 'figlet':
+                    option_suffixes = ('flf', 'flf2')
+                options = []
+                if not option_dir or not option_dir.is_dir():
+                    detail = None
+                    continue
+                for suffix in option_suffixes:
+                    for figfont in option_dir.glob('*.' + suffix):
+                        if figfont.is_file():
+                            options.append(figfont.name)
+                if detail:
+                    if detail in options:
+                        filtr = [filtr, '-f', detail]
+                    elif detail.isdigit():
+                        choice = int(detail)
+                        if choice >= 0 and choice < len(options):
+                            filtr = [filtr, '-f', options[choice]]
+
+                if isinstance(filtr, str):
+                    detail = select("Which fontfile to use?", options)
+                    filtr = [filtr, '-f', detail]
+        detail = None
+        if filtr == 'normal':
+            print("Ok. No confirmation needed.")
+            confirmed = True
+        else:
+            got = run(filtr, capture_output=True, input=msg, text=True)
+            filtered = got.stdout
+            if not filtered.strip():
+                print("No output from filter. That's not aceptable.")
+                continue
+            print(filtered)
+            yna = yes_no_abort("Is this acceptable?")
+            if yna == 'a':
+                print("Aborting write operation")
+                confirmed = True
+                ok_msg = None
+            elif yna == 'n':
+                print("Okay, let's try again.")
+            elif yna == 'y':
+                confirmed = True
+                ok_msg = filtered
+    return ok_msg
+
+
+
+def update_local_users():
+    global users
+    for user in users.values():
+        if not user.is_remote:
+            user.mesg_ok = False
+    got = run(['who', '-T'], capture_output=True, check=True, text=True)
+    output = got.stdout.splitlines()
+    for line in output:
+        fields = line.split(maxsplit=5)
+        if len(fields) < 4:
+            continue
+        if fields[0] in users:
+            user = users.get(fields[0])
+        else:
+            user = User.make(fields[0])
+            users[fields[0]] = user
+        user.logged_in = True
+        if fields[1] == '+':
+            user.mesg_ok = True
+        user.last_login = arrow.utcnow()
+        user.last_login.replace(hour=23, minute=59, second=59)
+        ## BSD's version is more painful to parse
+        #user.last_login = arrow.get(f"{fields[3]} {fields[4]} {fields[5]}", 'MMM D HH:mm')
+        ## GNU coreutils can be parsed more easily:
+        #user.last_login = arrow.get(f"{fields[3]} {fields[4]}")
+
+    for user in users.values():
+        if user.is_remote or user.logged_in:
+            continue
+        if BSD_LAST:
+            got = run([ 'last',
+                            '-1', # limit to last entry
+                            user.username
+                            ], capture_output=True, check=True, text=True)
+            last_re = LAST_RE_BSD
+        else:
+            got = run([ 'last',
+                            '-w', # full username and DNS names
+                            '-R', # ignore DNS name
+                            '-n1', # limit to last entry
+                            '--time-format=iso', # Use an easy-to-parse time format
+                            user.username
+                            ], capture_output=True, check=True, text=True)
+            last_re = LAST_RE
+
+        output = got.stdout.splitlines()
+        if len(output) < 1 or len(output[0]) == 0:
+            user.last_login = arrow.get(0)
+            continue
+        bits = last_re.match(output[0])
+        if bits is None:
+            print('Error: Unable to parse `last` output.\n',output[0])
+        else:
+            if bits['endtime'] == STILL_LOGGED_IN:
+                # `screen` (and probably `tmux`) can hide a person from `who`
+                user.logged_in = True
+                user.last_login = arrow.utcnow()
+                user.last_login.replace(hour=23, minute=59, second=59)
+            else:
+                if 'T' in bits['starttime']:
+                    # ISO time
+                    user.last_login = arrow.get(bits['starttime'])
+                else:
+                    # BSD Time
+                    user.last_login = arrow.get(bits['starttime'], 'ddd MMM D HH:mm')
+                    now = arrow.now()
+                    user.last_login = user.last_login.replace(year=now.year)
+                    if user.last_login > now:
+                        user.last_login = user.last_login.replace(year=now.year-1)
+
+
+def populate_remote_user_table(user):
+    # Treat the passed in table as a user table.
+    # At a bare minimum it should have username set to a remote
+    # username, e.g user@host.
+    # Try to remotely finger that user, and extract as much data
+    # as we can from the result, e.g. login status and times,
+    # plan, timezone, etc.  Store it in the user table.
+    # This can be used to initialise a new remote user table OR
+    # to update an existing one by overwriting changed values.
+
+    if user.username is None:
+        return None
+
+    got = run(['finger', user.username],
+                            capture_output=True, text=True)
+    # These failures are unreliable.
+    if (not got.stdout.strip() or got.stdout.find('no such user') > 0
+                               or got.stdout.find('non-existent user') > 0):
+        return None
+    user.is_remote = True
+    fingered = got.stdout.replace('  ','\t').replace("\t","\n")
+    fields = {}
+    building = []
+    for line in fingered.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        elif line.startswith('[plan]:') or line.startswith('Plan:'):
+            building = []
+            building.append(line.split(':',1)[-1])
+            fields['Plan'] = building
+        elif line.startswith('No Plan.'):
+            building = []
+            fields['Plan'] = 'No plan.'
+        elif line.startswith('Project:'):
+            building = []
+            building.append(line.split(':',1)[-1])
+            fields['Project'] = building
+        elif line.startswith('Name:') or line.startswith('Full name:'):
+            building = []
+            building.append(line.split(':',1)[-1])
+            fields['Name'] = building
+        elif line.startswith('Last logged in') or line.startswith('Last login'):
+            building = []
+            fields['Last'] = line.split('in',1)[-1].split('(',1)[0].strip()
+        elif line.startswith('Timezone:'):
+            building = []
+            fields['Timezone'] = line.split(':',1)[-1].strip()
+        elif line.startswith('On since') or line.startswith('Online.'):
+            building = []
+            fields['Online'] = 'Online'
+        elif line.startswith('(messages off)'):
+            building = []
+            fields['mesg'] = '+'
+        elif line.startswith('(messages on)'):
+            building = []
+            fields['mesg'] = '-'
+        elif line.startswith('New mail'):
+            building = []
+        elif line.startswith('Unread since'):
+            building = []
+        else:
+            building.append(line)
+    for f in fields.keys():
+        if isinstance(fields[f], list):
+            fields[f] = ' '.join(fields[f]).strip()
+
+    user.remote_plan = fields.get('Plan')
+    user.tz = fields.get('Timezone')
+    if 'Online' in fields:
+        user.logged_in = True
+        user.last_login = arrow.utcnow()
+        user.last_login.replace(hour=23, minute=59, second=59)
+    elif 'Last' in fields:
+        # User is logged out, but we can see when they were last logged in
+        user.logged_in = False
+        user.last_login = arrow.get(fields['Last'])
+    return got.stdout
+
+
+def check_perms():
+    # Check the permissions on the executing user's .plan, .project and .tz
+    # files, and offer to fix them if they aren't world readable.
+    files = { ".project", ".plan", ".tz" }
+    for cfile in ( ".project", ".plan", ".tz" ):
+        path = Path.home() / cfile
+        if not path.exists():
+            continue
+        try:
+            perms = path.stat().st_mode
+            if perms & 0o444 != 0o444:
+                print("Hey, your {cfile} file isn't world readable!")
+                resp = input("Would you like me to fix it for you? (y/n) ").lower()
+                if resp == 'y':
+                    path.chmod(perms | 0o444)
+        except:
+            print("Something didn't quite go smoothly. Are you really the owner?")
+    return
+
+def load_user_file(filename):
+    if isinstance(filename, str):
+        if not '/' in filename:
+            path = Path.home() / '.bellowsh' / filename
+        else:
+            path = Path(filename)
+            if not path.is_absolute():
+                return set()
+    if not path.exists():
+        return set()
+    out = set()
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line[0] == '#':
+            continue
+        out.add(line)
+    return out
+
+valid_shells = load_user_file("/etc/shells")
+
+def add_local_users():
+    global valid_shells
+    global users
+    to_ignore = load_user_file("ignored_locals")
+    to_highlight = load_user_file("highlight_locals")
+
+    valid_users = None
+    users_gid = None
+    try:
+        users_grp = grp.getgrnam("users")
+        users.extend(users_grp.gr_mem)
+        users_gid = users_grp.gr_gid
+    except:
+        pass
+
+    for pwent in pwd.getpwall():
+        if not invalid_user(pwent, valid_shells=valid_shells, users_gid=users_gid,
+                    valid_users=valid_users) or pwent.pw_name in to_ignore:
+            #print(f'pwent {pwent.pw_name} ... invalid')
+            continue
+
+        user = User.make(pwent.pw_name)
+        user.home = pwent.pw_dir
+
+        tz_file = Path.home() / ".tz"
+        if tz_file.exists():
+            user.tz = tz_file.read_text().strip()
+        users[user.username] = user
+        if user.username in to_highlight:
+            user.highlight = True
+
+
+
+def expand_to_bellowsh(filename):
+    bellowsh = Path.home() / '.bellowsh'
+    if not bellowsh.exists():
+        bellowsh.mkdir()
+    if isinstance(filename, str):
+        if not '/' in filename:
+            path = bellowsh / filename
+        else:
+            path = Path(filename)
+            if not path.is_absolute():
+                return None
+        return path
+    if isinstance(filename, Path):
+        return filename
+    return None
+
+def del_from_user_file(filename, delthis):
+    path = expand_to_bellowsh(filename)
+    if path is None:
+        return
+    if not path.exists():
+        return
+
+    if isinstance(delthis, str):
+        delthis = delthis.splitlines()
+    if isinstance(addthis, (tuple,list)):
+        delthis = set(delthis)
+
+    out = []
+    old_text = path.read_text().splitlines()
+    for line in old_text:
+        if not line or line[0] == '#':
+            out.append(line)
+            continue
+        if line.strip() in delthis:
+            continue
+        out.append(line)
+    if len(out) > 1 and out[-1] != '':
+        out.append('')
+    path.write_text('\n'.join(out))
+    return
+
+def add_to_user_file(filename, addthis):
+    path = expand_to_bellowsh(filename)
+    if path is None:
+        return
+    out = []
+    if isinstance(addthis, (tuple,set)):
+        addthis = list(addthis)
+    if isinstance(addthis, list):
+        addthis = "\n".join(addthis)
+    if path.exists():
+        old_text = path.read_text()
+        if old_text:
+            out.append(out_text)
+            if not old_text.endswith('\n'):
+                out.append('\n')
+    out.append(addthis)
+    if not addthis.endswith('\n'):
+        out.append('\n')
+    path.write_text(''.join(out))
+    return
+
+def add_remote_users():
+    global users
+    for remote in load_user_file("remote_users"):
+        user = User.make(remote)
+        users[remote] = user
+
+def get_plan_line(user, *, limit=48):
+    # Return a possibly truncated plan line to display in the main user listing.
+    plan = None
+    if user.is_remote:
+        plan = user.remote_plan
+        if not plan or not plan.strip():
+            plan = 'No remote plan.'
+    else:
+        try:
+            if not Path(f"~{user.username}/.nofinger").expanduser().exists():
+                return "No plan."
+            planfile = Path(f"~{user.username}/.plan").expanduser()
+            if not planfile.exists():
+                return "No plan."
+            plan = planfile.read_text()
+        except:
+            plan = "Unscrutible plan."
+    try:
+        # Whitespace collapse (def. other ways to do this.)
+        plan = " ".join(plan.split()).strip()
+    except:
+        plan = "Unreadable plan."
+
+    if len(plan) > limit:
+        return plan[:limit-3] + "..."
+    return plan
+
+
+def update_remote_users():
+    # Do a remote finger on each remote user and update their info.
+    global users
+    first = True
+    for user in users.values():
+        if not user.is_remote:
+            continue
+        if first:
+            print("Polling remote hosts",end="")
+            first = False
+        else:
+            print(".",end="")
+        sys.stdout.flush()
+        populate_remote_user_table(user)
+    print()
+
+def invalid_user(user, *, valid_shells, valid_users, users_gid):
+    ''' Confirm we have a valid user via password entry.
+
+        This should be a relatively common standard for determining
+        'valid user'.
+
+        - Super User (root) is disallowed
+        - Does the home directory exist and uses a full path to a directory?
+        - Does the shell exist and uses the full path?
+        - Check against hard-coded 'never-valid' shells.
+          (Fail-safe if /etc/shells isn't available.)
+        - if /etc/shells exist, is the shell listed there?
+          (The old standard for FTP, etc.)
+        - if 'users' group exists, is the user a member?
+          (SSH can be configured to require group membership.)
+    '''
+
+    #print(repr(user.pw_name), ' ', end='')
+    global NEVER_VALID_SHELLS
+    if user.pw_uid == 0:
+        return False
+    home_dir = Path(user.pw_dir)
+    if not home_dir.is_absolute() or not home_dir.exists() or not home_dir.is_dir():
+        #print("Home")
+        return False
+    shell = Path(user.pw_shell)
+    if not shell.is_absolute() or not shell.exists():
+        #print("Shell")
+        return False
+    if shell.name in NEVER_VALID_SHELLS:    
+        #print("Never Shell")
+        return False
+    if valid_shells and str(shell) not in valid_shells:
+        #print("Invalid Shell")
+        return False
+    
+    # if the GID matches, it likely won't be in valid_users
+    if users_gid is not None and users_gid == user.pw_gid:
+        #print("!GID match")
+        #print(repr(user.pw_name), 'GID match')
+        return True
+    if valid_users and user.pw_name not in valid_users:
+        #print("Invalid user")
+        return False
+    #print("!Fine")
+    #print(repr(user.pw_name), 'Fine')
+    return True
+
+
+def edit_file(filename):
+    if isinstance(filename, str):
+        filename = Path.home() / filename
+    run([get_editor(), str(filename)])
+    try:
+        perms = filename.stat().st_mode
+        if perms & 0o444 != 0o444:
+            filename.chmod(perms | 0o444)
+    except:
+        print(f'You might want to check the ownership and permissions\nof {filename!s}.')
+
+
+class BellowUserCmd(Cmd):
+    intro = ''
+    prompt = '? '
+    current_user = None
+
+    aliases = {
+        'EOF': 'done',
+        'q': 'done',
+        'quit': 'done',
+
+        'o': 'online', 
+        'p': 'plan',
+        'P': 'project',
+        'r': 'refresh',
+        't': 'timezone',
+        'i': 'ignore',
+
+        'f': 'finger',
+        'p': 'proc',
+    }
+
+    def __init__(self, *args, user, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.current_user = user
+        p = colourise("cyan", user.username)
+        self.intro = f"Selected {user.username}"
+        self.prompt = f"{p} > "
+
+    def do_online(self, args):
+        'Check if user is online'
+        if self.current_user.logged_in:
+            print(f'{self.current_user.username} is {colourise("green", "online")}.')
+        elif self.current_user.is_remote:
+            print(f'{self.current_user.username} is remote and may be offline.')
+        else:
+            print(f'{self.current_user.username} is {colourise("red", "offline")}.')
+
+    def do_finger(self, *args):
+        'Finger the user'
+        run_if_installed('finger', user=self.current_user)
+
+    def do_proc(self, *args):
+        "Display a user's list of running processes"
+        global BSD_PS
+        user = self.current_user.username
+        if self.current_user.is_remote:
+            print("Process list not available for remote users.")
+            return
+        if BSD_PS:
+            run(['ps','-u',user,'-o','pid,pcpu,pmem,stime,time,args'])
+        else:
+            run(['ps','-u',user,'--forest','-o','pid,pcpu,pmem,stime,time,args'])
+
+    def do_talk(self, *args):
+        run_if_installed(("ytalk", "talk"), 
+                user=self.current_user, remote_failure=True)
+
+    def do_write(self, args):
+        user = self.current_user
+        argv = []
+        ask_msg = None
+        ask_how = None
+        ask_how_detail = None
+        if args:
+            argv = shlex.split(args)
+            ask_msg = argv[0]
+            ask_how = argv[1] if len(argv) > 1 else None
+            ask_how_detail = argv[2] if len(argv) > 2 else None
+        if user.is_remote:
+            print(f"Write is not available for remote users.")
+            return
+        if not on_path('write'):
+            print(f"Write is not installed.")
+            return
+        if ask_msg:
+            msg = ask_msg
+        else:
+            print(f"What do you want to say to {self.current_user.username}?")
+            msg = input(f"? ")
+        
+        msg = select_filter(msg, how=ask_how, detail=ask_how_detail)
+        if msg:
+            msg = msg + '\n'
+            print(f"Now `write`ing to {self.current_user.username} ...")
+
+            run_if_installed('write', user=self.current_user,
+                    remote_failure=True,
+                    input_msg=msg)
+
+    def do_d(self, *args):
+        return self.do_done()
+
+    def do_EOF(self, args=None):
+        return True
+
+    def do_done(self, *args):
+        'Done.'
+        return True
+
+    def emptyline(self):
+        pass
+
+
+def complete_user(key, users, user_cache):
+    current_user = None
+    ret = []
+    if key.isdigit():
+        idx = int(key)
+        scale = 1
+        while idx <= len(user_cache):
+            for i in range(scale):
+                ret.append(str(idx+i))
+            idx *= 10
+            scale *= 10
+    else:
+        for user in users:
+            if user.startswith(key):
+                ret.append(user)
+    return ret
+
+def lookup_user(key, users, user_cache):
+    current_user = None
+    if key.isdigit():
+        idx = int(key) - 1
+        if idx >= 0 and idx < len(user_cache):
+            current_user = user_cache[idx]
+    elif key in users:
+        current_user = users[key]
+    return current_user
+
+class BellowCmd(Cmd):
+    intro = ''
+    prompt = '> '
+    user_cache = []
+
+    aliases = {
+        'EOF': 'quit',
+        'q': 'quit',
+        'e': 'edit',
+        'o': 'online', 
+        'p': 'plan',
+        'P': 'project',
+        'r': 'refresh',
+        't': 'timezone',
+        'l': 'list',
+        'i': 'ignore',
+        'c': 'colour',
+        'color': 'colour',
+        'a': 'add',
+        'g': 'user',
+        'goto': 'user',
+        'u': 'user',
+    }
+
+    def do_quit(self, *args):
+        'Quit.'
+        return True
+
+    def do_edit(self, *args):
+        'Edit your GECOS info'
+        print("Editing your GECOS information via `chfn`...")
+        run("chfn")
+
+    def do_add(self, remote_user=None, *args):
+        "Add remote user to roster"
+        global users
+        if remote_user is not None:
+            remote = remote_user
+        else:
+            print("Remote user or local user to highlight: ")
+            remote = input("user: ").strip()
+        if not remote:
+            print("Cancelling add.")
+            return
+
+        if '@' not in remote or remote.endswith('@localhost'):
+            print("Not a remote username. Adding to 'highlight_locals'...")
+            remote = remote.split('@')[0]
+            if remote not in users:
+                print('Local user does not exist!')
+                return
+            add_to_user_file('highlight_locals', remote)
+            users[remote].highlight = True
+        elif remote in users:
+            print("User already in roster!")
+            return
+        else:
+            user = User.make(remote)
+            finger_output = populate_remote_user_table(user)
+            if finger_output:
+                users[remote] = user
+                add_to_user_file('remote_users', remote)
+                self.user_cache = None
+            else:
+                print("Adding remote user failed.")
+                return
+        print(finger_output)
+        return
+
+    def do_colour(self, *args):
+        "Toggle coloured output"
+        global colours
+        colours = not colours
+
+    def do_ignore(self, ignore_user=None, *args):
+        "Ignore local user"
+        if ignore_user:
+            username = ignore_user
+        else:
+            username = input("User to ignore: ")
+        if username == "":
+            print("Cancelling ignore.")
+            return
+        if username not in users:
+            print("No such user!")
+            return
+        is_remote = users[username].is_remote
+        if not is_remote and users[username].highlight:
+            print(f"Removing local highlight for {username}.")
+            users[remote].highlight = True
+            del_from_user_file('highlight_locals', username)
+            return
+        del users[username]
+        self.user_cache = None
+        if is_remote:
+            print(f"Removing remote user `{username}` from `remote_users` ...")
+            del_from_user_file('remote_users', username)
+        else:
+            print(f"Ignoring local user `{username}`.")
+            add_to_user_file('ignored_locals', username)
+
+    def do_list(self, arg=None):
+        'List all users'
+        # Display a summary list of all users, indicating their login status, timezone
+        # and plan.  This is the main "view" of the the program.
+        global users
+        global args
+
+        if len(users) == 0:
+            print("Ain't nobody here but you!")
+            return
+
+        print(f'{"ID":3}*'
+                f'{"USERNAME":24}'
+                f'{"LAST LOGIN":18}'
+                f'{"LOCAL TIME":12}'
+                'PLAN')
+
+        if not self.user_cache or len(self.user_cache) != len(users):
+            self.user_cache = list(users.values())
+            self.user_cache.sort(key = lambda x: x.username)
+            self.user_cache.sort(key = lambda x: x.last_login.timestamp)
+
+        for idx, user in enumerate(self.user_cache):
+            if args.online_only and not user.logged_in:
+                continue
+
+            print(f'{idx+1:<3}', end='')
+            if user.mesg_ok:
+                print(colourise("green",'+'),end='')
+            else:
+                print(' ',end='')
+            if user.logged_in:
+                print(colourise("green",f'{user.username:24}'),end='')
+            else:
+                print(f'{user.username:24.24}',end='')
+
+            if user.logged_in:
+                print(f'{"Logged in now":18}',end='')
+            elif user.last_login == None or user.last_login.timestamp == 0:
+                if user.is_remote:
+                    print(f'{"Unknown (remote)":18}',end='')
+                else:
+                    print(f'{"None lately":18}',end='')
+            else:
+                lastlogin_str = user.last_login.humanize()
+                print(f'{lastlogin_str:18}',end='')
+
+            if user.tz:
+                ok = False
+                try:
+                    time = arrow.now().to(user.tz)
+                    time_str = time.format("DD hh:mma")
+                    print(f'{time_str:12}',end='')
+                except:
+                    print("{'Invalid TZ':12}",end='')
+            else:
+                print(f"{'No TZ set.':12}",end='')
+            print(get_plan_line(user))
+
+    def do_unalias(self, args):
+        notions = args.split(maxsplit=1)
+        for n in notions:
+            if n in self.aliases:
+                del self.aliases[n]
+
+    def do_alias(self, args):
+        argv = []
+        if args:
+            argv = shlex.split(args, comments=True)
+        if len(argv) == 1:
+            argv = argv[0].split('=', maxsplit=1)
+        for v in argv[0:-1]:
+            self.aliases[v] = argv[-1]
+
+
+    def precmd(self, args):
+        argv = shlex.split(args, comments=True)
+
+        if argv and argv[0]:
+            cmd_name = 'do_' + argv[0]
+            if hasattr(self, cmd_name):
+                return args 
+        
+            if argv[0] in self.aliases:
+                argv[0:1] = shlex.split(self.aliases[argv[0]])
+            else:
+                check_user = lookup_user(argv[0], users=users, user_cache=self.user_cache)
+                if check_user is not None:
+                    argv[0:1] = ['user', check_user.username]
+        return shlex_join(argv)
+
+    def do_online(self, arg=None):
+        'Toggle online only view'
+        global args
+        args.online_only = not args.online_only
+        self.do_list()
+
+    def do_plan(self, *args):
+        "Edit your .plan file"
+        edit_file(".plan")
+
+    def do_project(self, *args):
+        'Edit your .project file'
+        edit_file(".project")
+
+    def do_refresh(self, *args):
+        'Refresh list'
+        # Poll all remote hosts to update user information.
+        update_local_users()
+        update_remote_users()
+        self.do_list()
+
+    def do_timezone(self, zoneid="", *args):
+        'Update your timezone file'
+        db_path = Path("/usr/share/zoneinfo")
+        if not db_path.exists():
+            print("Sorry, can't find local timezone database...")
+            return
+        country = None
+        city = None
+        accept = False
+        quitting = False
+        tz_string = None
+
+        if zoneid:
+            tz_string = zoneid
+            try:
+                time = arrow.utcnow().to(tz_string).ctime()
+                print("Is this your local time? ")
+                resp = input(f"{time} [y/n/a] ").lower()
+                if resp == 'n':
+                    pass
+                elif resp != 'y':
+                    quitting = True
+                else:
+                    accept = True
+            except:
+                print(f"The time zone '{tz_string}' was not a valid.")
+                pass
+        else:
+            zoneid = None
+
+        while not accept and not quitting:
+            if zoneid and '/' not in zoneid:
+                country_path = db_path / zoneid
+                if country_path.exists():
+                    country = zoneid
+            
+            while country is None and not quitting:
+                countries = []
+                for c in db_path.glob('*'):
+                    if not c.is_dir():
+                        continue
+                    countries.append(c.name)
+                countries.sort()
+
+                for idx, country in enumerate(countries):
+                    idx_str = f'[{idx+1}]'
+                    print(f'{idx_str:5}{country:18}',end='')
+                    if (idx+1) % 4 == 0:
+                        print('')
+                else:
+                    if (idx+1) % 4 != 0:
+                        print('')
+                print(f"{'[c]':5}{'Cancel':18}")
+                selected = input("Choose your country/region: ").strip()
+                if not selected:
+                    quitting = True
+                    continue
+                elif selected.isdigit():
+                    index = int(selected) - 1
+                    if index > len(countries) or index < 0:
+                        quitting = True
+                        continue
+                    country = countries[index]
+                elif selected in ("c", "C"):
+                    quitting = True
+                    continue
+                elif selected in countries:
+                    country = selected
+                else:
+                    print("Invalid choice.")
+
+            country_path = db_path / country
+            while city is None and not quitting:
+                cities = []
+                for c in country_path.glob('*'):
+                    if not c.is_file():
+                        continue
+                    cities.append(c.name)
+                cities.sort()
+
+                for idx, city in enumerate(cities):
+                    idx_str = f'[{idx+1}]'
+                    print(f'{idx_str:5}{city:18}',end='')
+                    if (idx + 1) % 4 == 0:
+                        print('')
+                else:
+                    if (idx+1) % 4 != 0:
+                        print('')
+                print(f"{'[c]':5}{'Cancel':18}")
+
+                selected = input("Choose your city: ").strip()
+                if not selected:
+                    quitting = True
+                    continue
+                elif selected.isdigit():
+                    index = int(selected) - 1
+                    if index > len(cities) or index < 0:
+                        quitting = True
+                        continue
+                    city = cities[index]
+                elif selected in ("c", "C"):
+                    quitting = True
+                    continue
+                elif selected in cities:
+                    city = selected
+                else:
+                    print("Invalid choice.")
+            if quitting:
+                continue
+
+            tz_string = f"{country}/{city}"
+            print("Is this your local time? ")
+            time = arrow.utcnow().to(tz_string).ctime()
+            resp = input(f"{time} [y/n/a] ").lower()
+            if resp == 'n':
+                country = None
+                city = None
+                continue
+            elif resp != 'y':
+                quitting = True
+            else:
+                accept = True
+
+        if accept:
+            print("Writing '{tz_string}' to `~/.tz` file...")
+            tz_file = Path.home() / ".tz"
+            tz_file.write_text(tz_string + '\n')
+            try:
+                perms = tz_file.stat().st_mode
+                if perms & 0o444 != 0o444:
+                    path.chmod(perms | 0o444)
+            except:
+                print(f'You might want to check the ownership and permissions\nof {tz_file!s}.')
+
+    def complete_user(self, text, line, begidx, endidx):
+        argv = shlex.split(line[0:begidx])
+        if len(argv) == 1:
+            return complete_user(text, users=users, user_cache=self.user_cache)
+        ret = []
+        for do_cmd in dir(BellowUserCmd):
+            if do_cmd.startswith('do_'):
+                cmd = cmd[3:]
+                if cmd.startswith(text):
+                    ret.append(cmd)
+        return ret
+
+    def do_user(self, args = None):
+        'Display user info'
+        # "Go to" a particular user.  This will display the results of fingering
+        # them and then display a sub-prompt giving options to interact with them
+        # or view other details.
+        pre_user = None
+        pre_cmd = None
+        argv = []
+        if args:
+            argv = shlex.split(args)
+        if len(argv) > 0:
+            pre_user = lookup_user(argv[0], users=users, user_cache=self.user_cache)
+            if pre_user is None:
+                print(f"Unknown user {argv[0]}. Let's try again.")
+            elif len(argv) > 1:
+                pre_cmd = shlex_join(argv[1:])
+        if pre_user:
+            current_user = pre_user
+        else:
+            key = input("Which user? (username or ID) ")
+            current_user = lookup_user(key, users=users, user_cache=self.user_cache)
+
+        if current_user is None:
+            print("No such user, use numeric ID or full username.")
+            return
+
+        ucmd = BellowUserCmd(user=current_user)
+        if pre_cmd:
+            ucmd.onecmd(pre_cmd)
+        else:
+            run_if_installed("finger", user=current_user)
+            ucmd.cmdloop()
+            self.do_list()
+
+    def emptyline(self):
+        pass
+
+def main():
+    global parser
+    global args
+    args = parser.parse_args()
+    if args.local and args.remote:
+        print("Can't set -l and -r together!")
+        os.exit(1)
+    if not args.no_loop:
+        print("Welcome to bellowsh!")
+        check_perms()
+    if not args.remote:
+        add_local_users()
+    if not args.local:
+        add_remote_users()
+
+    # The do_refresh() command will update the metadata
+    # of all users, sort the user table and display it
+    f = BellowCmd()
+    f.do_refresh()
+
+    # If we're in non-interactive mode, that's it
+    if args.no_loop:
+        return
+
+    f.cmdloop()
+    run_if_installed("fortune")
+
+
+if __name__ == '__main__':
+    main()
+
